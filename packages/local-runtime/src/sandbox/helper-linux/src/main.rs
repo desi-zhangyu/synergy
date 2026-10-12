@@ -8,7 +8,7 @@
 
 use std::path::Path;
 use std::process::exit;
-use synergy_sandbox_linux::{bwrap, config, protected_create, seccomp};
+use synergy_sandbox_linux::{bwrap, config, controlled_tmp, protected_create, seccomp};
 #[derive(Debug, Clone)]
 struct HelperArgs {
     sandbox_policy_cwd: String,
@@ -50,7 +50,12 @@ fn main() {
         exit(1);
     });
 
-    ensure_controlled_tmp(&helper_args.sandbox_policy_cwd).unwrap_or_else(|e| {
+    let temporary = std::env::var_os("TMPDIR");
+    controlled_tmp::prepare(
+        Path::new(&helper_args.sandbox_policy_cwd),
+        temporary.as_deref().map(Path::new),
+    )
+    .unwrap_or_else(|e| {
         log::error!("Failed to prepare controlled /tmp: {e}");
         exit(1);
     });
@@ -174,10 +179,6 @@ fn build_inner_command(current_exe: &Path, args: &HelperArgs) -> Vec<String> {
     ];
     command.extend(args.child_command.clone());
     command
-}
-
-fn ensure_controlled_tmp(policy_cwd: &str) -> Result<(), std::io::Error> {
-    std::fs::create_dir_all(Path::new(policy_cwd).join(".synergy").join("tmp"))
 }
 
 fn bwrap_binary() -> String {

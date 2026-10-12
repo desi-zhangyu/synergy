@@ -83,3 +83,5 @@ Public subprocess entrypoints, including plugin Host Services, must enter native
 Treat formatter discovery commands as executable processes, not read-only declarations. Test stale edit versions both before and after admission, cancellation while queued, Workspace-specific subscriptions, and detached formatter descendants. Preserve the publisher Task across the full formatter sequence, and never start a second Task that can wait on its own publisher’s write reservation.
 
 For persistent permission replies, inject a storage failure before commit and verify both the pending request and the effective rule set. Do not remove the request or publish a cached allow before persistence succeeds. Exercise a multi-pattern grant atomically and serialize sibling replies that can cancel one another.
+
+For remote sandbox temporary paths, start from an absent session directory on the execution host. Verify actual shell and temporary-file writes after Workspace admission, repeated use, and symlink rejection; successful policy compilation does not prove bind sources exist.

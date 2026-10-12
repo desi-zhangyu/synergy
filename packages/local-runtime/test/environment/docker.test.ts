@@ -218,13 +218,21 @@ test.skipIf(!image)(
           id: "sandboxed",
           files: [{ name: "note.md", data: Buffer.from("reviewed note").toString("base64") }],
         })
+        const temporary = "/workspaces/.scratch/selected/.synergy/tmp/synergy-98-remote-session"
         const wrapper = await executor.prepareSandbox!({
           command: "/usr/bin/python3",
           args: [
             "-c",
             `
 from pathlib import Path
-import socket
+import socket, os, tempfile, sqlite3
+assert Path(os.environ["TMPDIR"]).is_dir()
+with tempfile.TemporaryDirectory() as tmp:
+    db = sqlite3.connect(str(Path(tmp) / "probe.db"))
+    db.execute("create table probe (value text)")
+    db.execute("insert into probe values ('remote temporary writes')")
+    assert db.execute("select value from probe").fetchone()[0] == "remote temporary writes"
+    db.close()
 assert Path(${JSON.stringify(inputs.paths["note.md"])}).read_text() == "reviewed note"
 try:
     Path(${JSON.stringify(inputs.paths["note.md"])}).write_text("changed")
@@ -256,6 +264,7 @@ print(Path("allowed").read_text(), end="")
           sandboxMode: "workspace_write",
           networkMode: "restricted",
           extraReadRoots: Object.values(inputs.paths),
+          extraWritableRoots: [temporary],
         })
         expect(wrapper.sandboxed).toBe(true)
         let sandboxed = await EnvironmentExecution.start({
@@ -267,7 +276,7 @@ print(Path("allowed").read_text(), end="")
             args: wrapper.args,
             sandboxID: wrapper.id,
             cwd: "/workspaces/.scratch/selected",
-            env: { PATH: "/usr/bin:/bin" },
+            env: { PATH: "/usr/bin:/bin", TMPDIR: temporary },
             useRoots: [],
           },
         })
