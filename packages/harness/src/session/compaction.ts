@@ -845,6 +845,11 @@ export namespace SessionCompaction {
       const outputBudget = Math.min(configuredOutput, OUTPUT_BUDGET)
       const budget = PromptBudgeter.budget(model.limit, { maxOutputTokens: outputBudget })
       const fixedMessages = projection.fixedIndexes.map((index) => request.messages[index])
+      const continuationAnchor = projection.fixedIndexes.some(
+        (index) => request.messageSources[index] === input.parentID,
+      )
+        ? undefined
+        : buildAnchor(input.messages, input.parentID)
       const fixedCost = await measure([...fixedMessages, { role: "user", content: promptText }])
       const inputBudget = model.limit?.context
         ? Math.min(budget.inputEnvelope, model.limit.context - outputBudget - budget.margin)
@@ -996,7 +1001,6 @@ export namespace SessionCompaction {
             apiModelID: model.api.id,
           },
         })
-        const anchor = buildAnchor(input.messages, input.parentID)
         const continuation: ModelMessage[] = input.auto
           ? [
               {
@@ -1004,7 +1008,7 @@ export namespace SessionCompaction {
                 content: [
                   { type: "text", text: "Continue if you have next steps" },
                   { type: "text", text: buildRecoveryHint({ sessionID: input.sessionID, summaryMessageID: msg.id }) },
-                  ...(anchor ? [{ type: "text" as const, text: anchor }] : []),
+                  ...(continuationAnchor ? [{ type: "text" as const, text: continuationAnchor }] : []),
                 ],
               },
             ]
@@ -1104,7 +1108,6 @@ export namespace SessionCompaction {
 
       if (input.auto) {
         abort.throwIfAborted()
-        const anchor = resolveAnchor(input.messages, input.parentID)
         await finalizeLocal(async () => {
           const continueMsg = await Session.updateMessage({
             id: Identifier.ascending("message"),
@@ -1142,7 +1145,7 @@ export namespace SessionCompaction {
             text: buildRecoveryHint({ sessionID: input.sessionID, summaryMessageID: msg.id }),
             time: { start: now, end: now },
           })
-          if (anchor) {
+          if (continuationAnchor) {
             await Session.updatePart({
               id: Identifier.ascending("part"),
               messageID: continueMsg.id,
@@ -1150,7 +1153,7 @@ export namespace SessionCompaction {
               type: "text",
               synthetic: true,
               origin: "system",
-              text: formatAnchor(anchor.text),
+              text: continuationAnchor,
               time: { start: now, end: now },
             })
           }

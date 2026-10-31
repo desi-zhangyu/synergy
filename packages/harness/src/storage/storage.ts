@@ -232,6 +232,13 @@ export namespace Storage {
     return active?.owner === RuntimeContext.tryCurrent() && Boolean(active?.transaction && active.effects)
   }
 
+  /** Release transaction-local host buffers after the durable outcome is known. */
+  export function afterSettlement(effect: (outcome: "committed" | "aborted" | "unknown") => void): void {
+    const active = context.getStore()
+    if (!active?.settled) throw new StorageConflictError("Settlement effects require a write transaction")
+    active.settled.push(effect)
+  }
+
   export function afterCommit(effect: () => Promise<unknown> | void): void {
     const active = context.getStore()
     if (!active?.effects) throw new StorageConflictError("Post-commit effects require a write transaction")

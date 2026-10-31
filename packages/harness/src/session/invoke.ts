@@ -1283,7 +1283,7 @@ export namespace SessionInvoke {
                       observation,
                     })
                   : undefined
-                if (advisoryHistory) lateSystemParts = []
+                if (advisoryHistory) lateSystemParts = memoryResult?.requestContext ?? []
                 if (contextMessage) sessionMessages.push(contextMessage)
                 const historyBeforeBytes = LLMTurnMemory.estimateBytes(sessionMessages)
                 using memoryTurn = LLMTurnMemory.begin({

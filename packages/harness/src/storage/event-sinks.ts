@@ -2,7 +2,7 @@ import { z } from "zod"
 import { RuntimeContext } from "../lifecycle/context"
 import { Storage } from "./storage"
 import { StorageIntegrityError } from "./errors"
-import type { StoredEvent, StoreTransaction, TransactionalStore } from "./transactional-store"
+import type { StoredEvent, StoredRecord, StoreTransaction, TransactionalStore } from "./transactional-store"
 
 export namespace StorageEventSinks {
   const DeliverySchema = z
@@ -16,13 +16,13 @@ export namespace StorageEventSinks {
     })
     .strict()
   export type Delivery = z.infer<typeof DeliverySchema>
+  export type Projection = { partition: string; payload: unknown; eventID?: string }
   export interface Sink {
     id: string
-    /** Transaction-local selection and projection; reads may await, external effects are forbidden. */
+    /** Ordered projections commit atomically with their source fact. External effects are forbidden. */
     capture(
       event: Readonly<StoredEvent>,
-    ):
-      { partition: string; payload: unknown } | undefined | Promise<{ partition: string; payload: unknown } | undefined>
+    ): Projection | Projection[] | undefined | Promise<Projection | Projection[] | undefined>
     /** Optional transaction-local host receipt after sequence allocation; no external effects. */
     captured?(delivery: Readonly<Delivery>): void | Promise<void>
     /** Acknowledges durable acceptance. Receivers deduplicate by eventID and sinkID. */
@@ -31,6 +31,8 @@ export namespace StorageEventSinks {
   const state = RuntimeContext.state(() => ({
     sinks: new Map<string, Sink>(),
     flushing: new WeakMap<TransactionalStore, Promise<unknown>>(),
+    accepted: new WeakMap<TransactionalStore, Map<string, StoredRecord<Delivery>>>(),
+    cleaning: new WeakMap<TransactionalStore, Promise<void>>(),
   }))
 
   export function register(sink: Sink) {
@@ -47,26 +49,30 @@ export namespace StorageEventSinks {
     for (const sink of state().sinks.values()) {
       const selected = await sink.capture(structuredClone(event))
       if (selected === undefined) continue
-      const partition = z.string().min(1).max(256).parse(selected.partition)
-      const meta = ["event_delivery_meta", sink.id, partition]
-      const [previous] = await tx.readMany<{ sequence: number }>([meta])
-      const sequence = (previous?.sequence ?? 0) + 1
-      const delivery = DeliverySchema.parse({
-        version: 1,
-        sinkID: sink.id,
-        eventID: event.id,
-        partition,
-        sequence,
-        payload: structuredClone(selected.payload),
-      })
-      await tx.write(meta, { sequence })
-      await tx.write(key(delivery), delivery)
-      await sink.captured?.(structuredClone(delivery))
+      for (const projection of Array.isArray(selected) ? selected : [selected]) {
+        const partition = z.string().min(1).max(256).parse(projection.partition)
+        const meta = ["event_delivery_meta", sink.id, partition]
+        const [previous] = await tx.readMany<{ sequence: number }>([meta])
+        const sequence = (previous?.sequence ?? 0) + 1
+        const delivery = DeliverySchema.parse({
+          version: 1,
+          sinkID: sink.id,
+          eventID: projection.eventID ?? event.id,
+          partition,
+          sequence,
+          payload: structuredClone(projection.payload),
+        })
+        await tx.write(meta, { sequence })
+        await tx.write(key(delivery), delivery)
+        await sink.captured?.(structuredClone(delivery))
+      }
     }
   }
 
-  /** Hosts explicitly pump bounded batches before admission and while serving, then drain on shutdown. */
-  export async function flush(options: { limit?: number } = {}): Promise<{ delivered: number }> {
+  /** Hosts may defer bounded local cleanup after the sink acknowledges acceptance. */
+  export async function flush(
+    options: { limit?: number; deferCleanup?: boolean } = {},
+  ): Promise<{ delivered: number }> {
     if (Storage.inTransaction()) throw new Error("Flush storage event sinks outside a transaction")
     const limit = z
       .number()
@@ -79,32 +85,39 @@ export namespace StorageEventSinks {
     const pending = (current.flushing.get(store) ?? Promise.resolve())
       .catch(() => {})
       .then(async () => {
-        const records = await Storage.query<Delivery>({ kind: "event_delivery", limit })
-        const accepted: typeof records = []
+        const accepted = current.accepted.get(store) ?? new Map<string, StoredRecord<Delivery>>()
+        current.accepted.set(store, accepted)
+        if (!options.deferCleanup || accepted.size >= 1024) await cleanup(store, accepted)
+        const alreadyAccepted = new Set(accepted.keys())
+        let after: string[] | undefined
+        let delivered = 0
         try {
-          for (const record of records) {
-            const delivery = DeliverySchema.parse(record.value)
-            if (JSON.stringify(key(delivery)) !== JSON.stringify(record.key))
-              throw new StorageIntegrityError("External event delivery identity does not match its record")
-            const sink = current.sinks.get(delivery.sinkID)
-            if (!sink) throw new StorageIntegrityError(`Storage event sink ${delivery.sinkID} is not registered`)
-            await sink.deliver(structuredClone(delivery))
-            accepted.push(record)
+          while (delivered < limit) {
+            const records = await Storage.query<Delivery>({
+              kind: "event_delivery",
+              limit: Math.min(limit - delivered, 1024),
+              after,
+            })
+            if (!records.length) break
+            for (const record of records) {
+              after = record.key
+              const identity = JSON.stringify(record.key)
+              if (alreadyAccepted.has(identity) || accepted.has(identity)) continue
+              const delivery = DeliverySchema.parse(record.value)
+              if (JSON.stringify(key(delivery)) !== identity)
+                throw new StorageIntegrityError("External event delivery identity does not match its record")
+              const sink = current.sinks.get(delivery.sinkID)
+              if (!sink) throw new StorageIntegrityError(`Storage event sink ${delivery.sinkID} is not registered`)
+              await sink.deliver(structuredClone(delivery))
+              accepted.set(identity, record)
+              delivered++
+            }
           }
         } finally {
-          // Commit the accepted prefix even if a later delivery fails. External
-          // effects stay outside the transaction and uncertain commits replay.
-          if (accepted.length)
-            await Storage.transaction(async (tx) => {
-              for (const record of accepted) {
-                const latest = await tx.versioned<Delivery>(record.key)
-                if (latest.revision !== record.revision)
-                  throw new StorageIntegrityError("External event delivery changed while awaiting acknowledgment")
-              }
-              await tx.removeMany(accepted.map((record) => record.key))
-            })
+          if (options.deferCleanup) void cleanup(store, accepted).catch(() => {})
+          else await cleanup(store, accepted)
         }
-        return { delivered: accepted.length }
+        return { delivered }
       })
     current.flushing.set(store, pending)
     try {
@@ -112,6 +125,47 @@ export namespace StorageEventSinks {
     } finally {
       if (current.flushing.get(store) === pending) current.flushing.delete(store)
     }
+  }
+
+  /** Accepted records awaiting local cleanup do not count as transport backlog. */
+  export async function hasPending(): Promise<boolean> {
+    const { store } = Storage.current()
+    const accepted = new Set(state().accepted.get(store)?.keys())
+    let after: string[] | undefined
+    for (;;) {
+      const records = await Storage.query<Delivery>({ kind: "event_delivery", limit: 128, after })
+      if (!records.length) return false
+      if (records.some((record) => !accepted.has(JSON.stringify(record.key)))) return true
+      after = records.at(-1)!.key
+    }
+  }
+
+  function cleanup(store: TransactionalStore, accepted: Map<string, StoredRecord<Delivery>>): Promise<void> {
+    const current = state()
+    const running = current.cleaning.get(store)
+    if (running) return running.then(() => cleanup(store, accepted))
+    const batch = [...accepted.values()].slice(0, 128)
+    if (!batch.length) return Promise.resolve()
+    const keys = batch.map((record) => record.key)
+    const task = Storage.transaction(
+      async (tx) => {
+        const latest = await tx.revisions(keys)
+        for (const [index, record] of batch.entries()) {
+          if (latest[index] !== record.revision)
+            throw new StorageIntegrityError("External event delivery changed while awaiting acknowledgment")
+        }
+        await tx.removeMany(keys)
+      },
+      { priority: "background" },
+    )
+      .then(() => {
+        for (const record of batch) accepted.delete(JSON.stringify(record.key))
+      })
+      .finally(() => {
+        current.cleaning.delete(store)
+      })
+    current.cleaning.set(store, task)
+    return task.then(() => cleanup(store, accepted))
   }
 
   function key(delivery: Delivery) {

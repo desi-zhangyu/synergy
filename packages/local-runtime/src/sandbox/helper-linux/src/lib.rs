@@ -4,6 +4,7 @@
 
 pub mod bwrap;
 pub mod config;
+pub mod controlled_tmp;
 pub mod error;
 pub mod glob_expand;
 pub mod landlock;
